@@ -1,0 +1,22 @@
+stackchan-muse
+Copyright 2026 nobaksan
+
+This project contains a patch for, and scripts around, software by others:
+
+- Muse Gadget SDK (https://github.com/facebookincubator/muse-gadget-sdk),
+  Copyright (c) Meta Platforms, Inc. and affiliates, Apache License 2.0.
+  firmware/muse-stackchan.patch modifies it; the SDK itself is not
+  redistributed here. setup.sh downloads it from Meta's repository. The SDK's
+  Jollybot avatar is not covered by its Apache license.
+- Servo and IO-expander constants in esp32/main/stackchan_head.c come from
+  M5Stack StackChan-BSP (https://github.com/m5stack/StackChan-BSP), MIT License.
+- The wake word uses Espressif ESP-SR (espressif/esp-sr), fetched at build
+  time under the ESPRESSIF MIT License (use on Espressif chips only).
+- setup.sh generates the caption font from GNU Unifont 16.0.04
+  (https://unifoundry.com/unifont/), SIL Open Font License 1.1 /
+  GNU GPL 2+ with the font embedding exception.
+- tts-relay uses edge-tts (https://github.com/rany2/edge-tts), which calls
+  Microsoft Edge's online read-aloud service. It is not an official API.
+
+Muse, Meta and StackChan are trademarks of their owners. This project is not
+affiliated with or endorsed by Meta, M5Stack or Espressif.

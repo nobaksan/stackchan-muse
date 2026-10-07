@@ -1,0 +1,1312 @@
+diff --git a/esp32/.gitignore b/esp32/.gitignore
+index 3f7ad4a..5fca44d 100644
+--- a/esp32/.gitignore
++++ b/esp32/.gitignore
+@@ -52,3 +52,7 @@ __pycache__/
+ .gradle/
+ .idea/
+ local.properties
++
++# Local SDK token overlay (book build)
++devices/sdkconfig.local-token
++devices/sdkconfig.local-tts
+diff --git a/esp32/components/muse/CMakeLists.txt b/esp32/components/muse/CMakeLists.txt
+index 2732802..d45bf7c 100644
+--- a/esp32/components/muse/CMakeLists.txt
++++ b/esp32/components/muse/CMakeLists.txt
+@@ -49,6 +49,9 @@ if(CONFIG_MUSE_ENABLED)
+         list(APPEND srcs "muse_chat_link.c")   # text replies over Link's session
+     endif()
+     list(APPEND srcs "muse_chat_text.c")
++    if(CONFIG_MUSE_WAKE_WORD)
++        list(APPEND srcs "muse_wake.c")
++    endif()
+     if(CONFIG_MUSE_CJK_FONT)
+         list(APPEND srcs "fonts/muse_font_cjk_16.c")   # captions' CJK fallback
+     endif()
+@@ -109,6 +112,11 @@ set(muse_priv_requires
+     esp_lcd esp_adc esp_driver_i2s esp_driver_ledc esp_driver_spi esp_driver_uart esp_wifi
+     esp_driver_pcnt)
+ list(APPEND muse_priv_requires camera)
++# esp-sr is fetched only for the CoreS3 (idf_component.yml); require it when it's there.
++idf_build_get_property(build_components BUILD_COMPONENTS)
++if("espressif__esp-sr" IN_LIST build_components)
++    list(APPEND muse_priv_requires espressif__esp-sr)
++endif()
+ 
+ idf_component_register(
+     SRCS ${srcs}
+diff --git a/esp32/components/muse/Kconfig b/esp32/components/muse/Kconfig
+index 0c18ced..c2617a2 100644
+--- a/esp32/components/muse/Kconfig
++++ b/esp32/components/muse/Kconfig
+@@ -134,6 +134,48 @@ menu "Muse"
+             memory and preview decoding shares CPU time with voice and Link.
+             Leave disabled to build without camera support.
+ 
++    config MUSE_WAKE_WORD
++        bool "Hands-free wake word (ESP-SR WakeNet)"
++        depends on MUSE_ENABLED && IDF_TARGET_ESP32S3 && SPIRAM
++        default n
++        help
++            Listen for a WakeNet wake word (pick it under ESP Speech
++            Recognition, CONFIG_SR_WN_*) while idle. Hearing it starts a voice
++            note as a talk press would, and the note ends by itself after
++            MUSE_WAKE_SILENCE_MS of quiet. Needs a "model" data partition.
++
++    config MUSE_WAKE_SILENCE_MS
++        int "Wake word: quiet that ends the note (ms)"
++        depends on MUSE_WAKE_WORD
++        default 900
++
++    config MUSE_WAKE_SPEECH_DBFS
++        int "Wake word: level counted as speech (dBFS)"
++        depends on MUSE_WAKE_WORD
++        range -80 -10
++        default -50
++
++    config MUSE_HTTP_TTS
++        bool "Speak replies through an HTTP TTS relay"
++        depends on MUSE_ENABLED
++        default n
++        help
++            Muse sends gadgets text. With this on, each finished reply
++            message is POSTed as {"text": ...} to MUSE_HTTP_TTS_URL with an
++            X-TTS-Key header, and the MP3 that streams back is played with
++            the captions following it. If the relay fails, the message is
++            shown silently as before.
++
++    config MUSE_HTTP_TTS_URL
++        string "TTS relay URL"
++        depends on MUSE_HTTP_TTS
++        default ""
++
++    config MUSE_HTTP_TTS_KEY
++        string "TTS relay key (X-TTS-Key)"
++        depends on MUSE_HTTP_TTS
++        default ""
++
+     config MUSE_CJK_FONT
+         bool "Show Chinese and Japanese in captions"
+         depends on MUSE_ENABLED
+diff --git a/esp32/components/muse/idf_component.yml b/esp32/components/muse/idf_component.yml
+index 28cdbf7..509a7c2 100644
+--- a/esp32/components/muse/idf_component.yml
++++ b/esp32/components/muse/idf_component.yml
+@@ -78,3 +78,7 @@ dependencies:
+     version: "1.2.1"
+     rules:
+       - if: "$CONFIG{MUSE_BOARD_ID} == \"waveshare_s3_lcd7\""
++  espressif/esp-sr:
++    version: "^2.5.5"
++    rules:
++      - if: "$CONFIG{MUSE_BOARD_ID} == \"m5stack_cores3\""
+diff --git a/esp32/components/muse/muse_chat_session.cpp b/esp32/components/muse/muse_chat_session.cpp
+index 9c99dc0..fe0c4b9 100644
+--- a/esp32/components/muse/muse_chat_session.cpp
++++ b/esp32/components/muse/muse_chat_session.cpp
+@@ -65,6 +65,9 @@
+ 
+ extern "C" {
+ #include "cJSON.h"
++#if CONFIG_MUSE_HTTP_TTS
++#include "esp_http_client.h"
++#endif
+ #include "minimp3.h"
+ #include "muse_account_api.h"
+ #include "muse_link.h"
+@@ -938,6 +941,21 @@ static size_t resample(resampler_t *r, const int16_t *in, size_t n, int16_t *out
+     return o;
+ }
+ 
++#if CONFIG_MUSE_HTTP_TTS
++/*
++ * Replies spoken through an HTTP TTS relay (CONFIG_MUSE_HTTP_TTS_URL). A helper
++ * task POSTs the message's text and pushes the MP3 into a stream buffer; this
++ * task drains it into tts_data() as if it came on a K_TTS stream.
++ */
++#define HTTP_TTS_SB (32 * 1024)
++enum http_tts_state_t : int { HT_IDLE, HT_RUNNING, HT_DONE, HT_FAILED };
++static StreamBufferHandle_t s_http_tts_sb;
++static std::atomic<int> s_http_tts_state{HT_IDLE};
++static std::atomic<bool> s_http_tts_abort{false};
++static int s_http_tts_msg = -1;
++static void http_tts_warm(void);
++#endif
++
+ /* ---- Turn: dictation ---- */
+ 
+ static void turn_reset_streams(void)
+@@ -954,6 +972,10 @@ static void turn_reset_streams(void)
+ static void turn_finish(void)
+ {
+     turn_reset_streams();
++#if CONFIG_MUSE_HTTP_TTS
++    s_http_tts_abort = true;
++    s_http_tts_msg = -1;
++#endif
+     s_turn.phase = P_IDLE;
+     s_turn.dict_id = s_turn.chat_id = 0;
+     s_turn.tts_msg = -1;
+@@ -1496,11 +1518,223 @@ static void on_chat_ack(stream_t *s)
+     mark(M_ACK);
+     ESP_LOGI(TAG, "chat/stream ack: user message %s", s_turn.user_ids[0]);
+     cJSON_Delete(root);
++#if CONFIG_MUSE_HTTP_TTS
++    if (!s_turn.text) {
++        http_tts_warm();
++    }
++#endif
+     emit(MUSE_HATCH_EV_SENT, nullptr);
+ }
+ 
+ /* ---- Turn: speech ---- */
+ 
++#if CONFIG_MUSE_HTTP_TTS
++static void tts_data(const uint8_t *data, size_t len);
++
++/*
++ * One long-lived worker owns the HTTP client, so the TLS connection (over 4 s
++ * on this chip) is opened once and kept alive: http_tts_warm() opens it while
++ * Muse is still thinking, and the reply's speech then reuses it.
++ */
++enum http_tts_job_t : uint8_t { HJ_WARM, HJ_SPEAK };
++struct http_tts_req_t {
++    http_tts_job_t kind;
++    char *body;
++};
++static QueueHandle_t s_http_tts_q;
++
++static void http_tts_drain(esp_http_client_handle_t c)
++{
++    static char sink[512];
++    while (esp_http_client_read(c, sink, sizeof(sink)) > 0) {
++    }
++}
++
++static bool http_tts_speak(esp_http_client_handle_t c, const char *body)
++{
++    static uint8_t buf[2048];
++    int len = (int)strlen(body);
++    int64_t t0 = now_us();
++    esp_http_client_set_method(c, HTTP_METHOD_POST);
++    for (int attempt = 0; attempt < 2; attempt++) {
++        /* A kept-alive connection the server has since closed fails here; reconnect once. */
++        ESP_LOGI(TAG, "tts relay: attempt %d, state %d, socket %d", attempt,
++                 (int)esp_http_client_get_state(c), esp_http_client_get_socket(c));
++        esp_err_t oerr = esp_http_client_open(c, len);
++        int wrote = oerr == ESP_OK ? esp_http_client_write(c, body, len) : -1;
++        int64_t hl = wrote == len ? esp_http_client_fetch_headers(c) : -1;
++        if (hl >= 0) {
++            break;
++        }
++        ESP_LOGW(TAG, "tts relay: attempt %d failed: open %s, wrote %d/%d, headers %lld", attempt,
++                 esp_err_to_name(oerr), wrote, len, (long long)hl);
++        esp_http_client_close(c);
++        if (attempt) {
++            ESP_LOGW(TAG, "tts relay: request failed");
++            return false;
++        }
++    }
++    int status = esp_http_client_get_status_code(c);
++    ESP_LOGI(TAG, "tts relay: headers after %lld ms", (long long)((now_us() - t0) / 1000));
++    if (status != 200) {
++        ESP_LOGW(TAG, "tts relay: HTTP %d", status);
++        http_tts_drain(c);
++        return false;
++    }
++    bool ok = false;
++    size_t total = 0;
++    for (;;) {
++        int n = esp_http_client_read(c, reinterpret_cast<char *>(buf), sizeof(buf));
++        if (n < 0 || s_http_tts_abort) {
++            break;
++        }
++        if (n == 0) {
++            ok = esp_http_client_is_complete_data_received(c);
++            break;
++        }
++        if (!total) {
++            ESP_LOGI(TAG, "tts relay: first %d bytes after %lld ms", n, (long long)((now_us() - t0) / 1000));
++        }
++        size_t off = 0;
++        while (off < (size_t)n && !s_http_tts_abort) {
++            off += xStreamBufferSend(s_http_tts_sb, buf + off, n - off, pdMS_TO_TICKS(100));
++        }
++        total += n;
++    }
++    ESP_LOGI(TAG, "tts relay: %u bytes in %lld ms%s", (unsigned)total,
++             (long long)((now_us() - t0) / 1000), ok ? "" : " (incomplete)");
++    if (!ok) {
++        esp_http_client_close(c);   /* don't reuse a half-read response */
++    }
++    return ok;
++}
++
++static void http_tts_worker(void *)
++{
++    esp_http_client_config_t cfg = {};
++    cfg.url = CONFIG_MUSE_HTTP_TTS_URL;
++    cfg.timeout_ms = 15000;
++    cfg.buffer_size = 2048;
++    cfg.crt_bundle_attach = esp_crt_bundle_attach;
++    esp_http_client_handle_t c = esp_http_client_init(&cfg);
++    if (c) {
++        esp_http_client_set_header(c, "Content-Type", "application/json");
++        esp_http_client_set_header(c, "X-TTS-Key", CONFIG_MUSE_HTTP_TTS_KEY);
++    }
++    for (;;) {
++        http_tts_req_t req;
++        xQueueReceive(s_http_tts_q, &req, portMAX_DELAY);
++        if (req.kind == HJ_WARM) {
++            if (!c) {
++                continue;
++            }
++            /* Any small request will do; GET /tts is refused at once and leaves the connection up. */
++            int64_t t0 = now_us();
++            esp_http_client_set_method(c, HTTP_METHOD_GET);
++            if (esp_http_client_open(c, 0) == ESP_OK && esp_http_client_fetch_headers(c) >= 0) {
++                http_tts_drain(c);
++                ESP_LOGI(TAG, "tts relay: warmed in %lld ms (state %d, socket %d, keep-alive %d)",
++                         (long long)((now_us() - t0) / 1000), (int)esp_http_client_get_state(c),
++                         esp_http_client_get_socket(c), (int)esp_http_client_is_persistent_connection(c));
++            } else {
++                esp_http_client_close(c);
++            }
++            continue;
++        }
++        bool ok = c && http_tts_speak(c, req.body);
++        free(req.body);
++        s_http_tts_state = ok ? HT_DONE : HT_FAILED;
++    }
++}
++
++static bool http_tts_ensure_worker(void)
++{
++    if (s_http_tts_q) {
++        return true;
++    }
++    s_http_tts_sb = xStreamBufferCreateWithCaps(HTTP_TTS_SB, 1, MALLOC_CAP_SPIRAM);
++    s_http_tts_q = xQueueCreate(2, sizeof(http_tts_req_t));
++    if (!s_http_tts_sb || !s_http_tts_q ||
++        xTaskCreatePinnedToCoreWithCaps(http_tts_worker, "http_tts", 12 * 1024, nullptr, 4, nullptr, 1,
++                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
++        ESP_LOGE(TAG, "tts relay: worker start failed");
++        s_http_tts_q = nullptr;
++        return false;
++    }
++    return true;
++}
++
++/* Opens the relay's connection ahead of the reply. */
++static void http_tts_warm(void)
++{
++    if (s_http_tts_state.load() == HT_RUNNING || !http_tts_ensure_worker()) {
++        return;
++    }
++    http_tts_req_t req = { HJ_WARM, nullptr };
++    xQueueSend(s_http_tts_q, &req, 0);
++}
++
++/* Starts fetching message i's speech. False if it couldn't start. */
++static bool http_tts_start(int i)
++{
++    if (!s_turn.texts || !http_tts_ensure_worker()) {
++        return false;
++    }
++    xStreamBufferReset(s_http_tts_sb);
++    cJSON *o = cJSON_CreateObject();
++    cJSON_AddStringToObject(o, "text", s_turn.texts + i * TEXT_MAX);
++    char *body = cJSON_PrintUnformatted(o);
++    cJSON_Delete(o);
++    if (!body) {
++        return false;
++    }
++    s_http_tts_abort = false;
++    s_http_tts_msg = i;
++    s_http_tts_state = HT_RUNNING;
++    http_tts_req_t req = { HJ_SPEAK, body };
++    if (xQueueSend(s_http_tts_q, &req, 0) != pdPASS) {
++        free(body);
++        s_http_tts_state = HT_IDLE;
++        s_http_tts_msg = -1;
++        return false;
++    }
++    return true;
++}
++
++/* Moves the relay's MP3 into the turn's buffer; ends the message's audio when it's all in. */
++static void http_tts_pump(void)
++{
++    if (s_turn.tts_msg < 0 || s_turn.silent || s_turn.mp3_ended || s_http_tts_msg != s_turn.tts_msg) {
++        return;
++    }
++    int st = s_http_tts_state.load();
++    static uint8_t tmp[2048];
++    while (MP3_BUF - s_turn.mp3_len > 0) {
++        size_t want = MP3_BUF - s_turn.mp3_len < sizeof(tmp) ? MP3_BUF - s_turn.mp3_len : sizeof(tmp);
++        size_t n = xStreamBufferReceive(s_http_tts_sb, tmp, want, 0);
++        if (!n) {
++            break;
++        }
++        tts_data(tmp, n);
++    }
++    if (st == HT_RUNNING || !xStreamBufferIsEmpty(s_http_tts_sb)) {
++        return;
++    }
++    s_http_tts_msg = -1;
++    s_http_tts_state = HT_IDLE;
++    if (st == HT_DONE) {
++        s_turn.mp3_ended = true;   /* decode() drains the rest, then finishes */
++        return;
++    }
++    /* The relay failed: show the message at reading pace instead. */
++    msg_t &m = s_turn.msgs[s_turn.tts_msg];
++    ESP_LOGW(TAG, "tts relay failed; showing message %s silently", m.id);
++    m.pcm_start = s_turn.pcm_out;
++    m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
++    s_turn.silent = true;
++}
++#endif
++
+ static void start_tts(void)
+ {
+     if (s_turn.tts_msg >= 0) {
+@@ -1526,6 +1760,26 @@ static void start_tts(void)
+          * end. decode() plays it at the speaker's volume, captions following,
+          * and finishes the message once it's drained.
+          */
++#if CONFIG_MUSE_HTTP_TTS
++        if (s_http_tts_state.load() == HT_RUNNING) {
++            return;   /* a cancelled turn's fetch is still winding down */
++        }
++        if (http_tts_start(i)) {
++            m.tts = TTS_ACTIVE;
++            s_turn.tts_msg = i;
++            s_turn.silent = false;
++            m.pcm_start = s_turn.pcm_out;
++            m.pcm_frames = 0;
++            s_turn.mp3_len = 0;
++            s_turn.mp3_ended = false;
++            s_turn.kbps = 0;
++            s_turn.down_rate = 0;
++            mp3dec_init(&s_turn.dec);
++            ESP_LOGI(TAG, "speaking message %s (%u chars)", m.id, (unsigned)m.len);
++            show_reply_start(m);
++            return;
++        }
++#endif
+         m.pcm_start = s_turn.pcm_out;
+         m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
+         m.tts = TTS_ACTIVE;
+@@ -1985,6 +2239,9 @@ static void hatch_task(void *arg)
+         }
+         if (s_turn.phase == P_WAIT_REPLY) {
+             start_tts();
++#if CONFIG_MUSE_HTTP_TTS
++            http_tts_pump();
++#endif
+             decode();
+         }
+         if (!s_connected) {
+diff --git a/esp32/components/muse/muse_voice.c b/esp32/components/muse/muse_voice.c
+index 3c68662..f6fdd56 100644
+--- a/esp32/components/muse/muse_voice.c
++++ b/esp32/components/muse/muse_voice.c
+@@ -37,6 +37,9 @@
+ #include "muse_settings.h"
+ #include "muse_state.h"
+ #include "muse_wifi.h"
++#if CONFIG_MUSE_WAKE_WORD
++#include "muse_wake.h"
++#endif
+ 
+ static const char *TAG = "muse_voice";
+ 
+@@ -51,6 +54,12 @@ static const char *TAG = "muse_voice";
+ #endif
+ #define SETTLE_CHUNKS 10   /* after Muse makes a sound, 200 ms of capture is its own tail */
+ #define REST_BACKSTOP_MS 60000
++#if CONFIG_MUSE_WAKE_WORD
++#define WAKE_QUIET_FRAMES (MUSE_AUDIO_RATE * CONFIG_MUSE_WAKE_SILENCE_MS / 1000)
++#define WAKE_NO_SPEECH_FRAMES (MUSE_AUDIO_RATE * 5)   /* woken but nothing said: give up */
++static bool s_wake_hit;     /* the wake word was heard while idle */
++static bool s_hands_free;   /* this note started from the wake word, so it ends on quiet */
++#endif
+ 
+ #if CONFIG_MUSE_HATCH
+ /* A note recorded while Hatch is out of reach is saved in PSRAM, and goes once it's back. */
+@@ -154,6 +163,11 @@ static void idle_capture(void)
+         s_settle--;
+         return;
+     }
++#if CONFIG_MUSE_WAKE_WORD
++    if (muse_wake_feed(s_chunk, MUSE_AUDIO_CHUNK)) {
++        s_wake_hit = true;
++    }
++#endif
+     pre_chunk_t *c = &s_pre[s_pre_next];
+ #if MUSE_LOW_MEM
+     c->start = s_pre_enc;
+@@ -277,6 +291,10 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
+     size_t pre = n;
+     bool released = false;
+     size_t stop_at = MAX_FRAMES;
++#if CONFIG_MUSE_WAKE_WORD
++    bool spoke = false;
++    size_t quiet = 0;
++#endif
+     while (n + MUSE_AUDIO_CHUNK <= stop_at) {
+         if (muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK) != ESP_OK) {
+             break;
+@@ -320,7 +338,27 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
+             released = true;
+             stop_at = n + TAIL_FRAMES < MAX_FRAMES ? n + TAIL_FRAMES : MAX_FRAMES;
+         }
++#if CONFIG_MUSE_WAKE_WORD
++        /* Woken by voice there's no release: the note ends after a pause. */
++        if (s_hands_free && !released) {
++            if (muse_audio_dbfs(s_chunk, MUSE_AUDIO_CHUNK) > CONFIG_MUSE_WAKE_SPEECH_DBFS) {
++                spoke = true;
++                quiet = 0;
++            } else {
++                quiet += MUSE_AUDIO_CHUNK;
++            }
++            if ((spoke && quiet >= WAKE_QUIET_FRAMES) || (!spoke && n - pre >= WAKE_NO_SPEECH_FRAMES)) {
++                ESP_LOGI(TAG, "wake word note: %s", spoke ? "ended on quiet" : "nothing said");
++                released = true;
++                stop_at = n;
++            }
++        }
++#endif
+     }
++#if CONFIG_MUSE_WAKE_WORD
++    s_hands_free = false;
++    muse_wake_reset();
++#endif
+     muse_state_set_level(0);
+     *held = n - pre;
+ 
+@@ -790,6 +828,9 @@ static void voice_task(void *arg)
+ {
+     bool pending_down = false;
+     muse_audio_selftest();
++#if CONFIG_MUSE_WAKE_WORD
++    muse_wake_init();
++#endif
+     for (;;) {
+         bool wake = false;
+         if (!pending_down) {
+@@ -845,6 +886,15 @@ static void voice_task(void *arg)
+             }
+             /* The 20 ms read paces this loop. */
+             idle_capture();
++#if CONFIG_MUSE_WAKE_WORD
++            if (s_wake_hit) {
++                s_wake_hit = false;
++                ESP_LOGI(TAG, "wake word heard: recording");
++                muse_state_poke();
++                pre_reset();   /* the wake word itself isn't part of the note */
++                s_hands_free = true;
++            } else {
++#endif
+             if (xQueueReceive(s_queue, &ev, 0) != pdTRUE) {
+                 continue;
+             }
+@@ -853,6 +903,9 @@ static void voice_task(void *arg)
+                 continue;
+             }
+             wake = ev.wake;
++#if CONFIG_MUSE_WAKE_WORD
++            }
++#endif
+         }
+         if (wake && !held_on_waking()) {
+             continue;   /* a tap: it only woke Muse */
+diff --git a/esp32/components/muse/muse_wake.c b/esp32/components/muse/muse_wake.c
+new file mode 100644
+index 0000000..c9060b7
+--- /dev/null
++++ b/esp32/components/muse/muse_wake.c
+@@ -0,0 +1,121 @@
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "muse_wake.h"
++
++#include <string.h>
++
++#include "esp_heap_caps.h"
++#include "esp_log.h"
++#include "freertos/FreeRTOS.h"
++#include "freertos/task.h"
++#include "esp_wn_iface.h"
++#include "esp_wn_models.h"
++#include "model_path.h"
++
++static const char *TAG = "muse_wake";
++
++static const esp_wn_iface_t *s_wn;
++static model_iface_data_t *s_md;
++static int16_t *s_buf;   /* one WakeNet chunk */
++static size_t s_chunk, s_fill;
++static int s_ignore;     /* chunks to run without acting on, after a reset */
++
++static bool load(void)
++{
++    srmodel_list_t *models = esp_srmodel_init("model");
++    char *name = models ? esp_srmodel_filter(models, ESP_WN_PREFIX, NULL) : NULL;
++    if (!name) {
++        ESP_LOGW(TAG, "no WakeNet model in the \"model\" partition");
++        return false;
++    }
++    s_wn = esp_wn_handle_from_name(name);
++    s_md = s_wn ? s_wn->create(name, DET_MODE_90) : NULL;
++    if (!s_md) {
++        ESP_LOGE(TAG, "couldn't load %s", name);
++        return false;
++    }
++    s_chunk = (size_t)s_wn->get_samp_chunksize(s_md);
++    s_buf = heap_caps_malloc(s_chunk * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
++    if (!s_buf) {
++        s_wn->destroy(s_md);
++        s_md = NULL;
++        return false;
++    }
++    ESP_LOGI(TAG, "listening for \"%s\" (%s, %u-sample chunks, %d Hz)", s_wn->get_word_name(s_md, 1), name,
++             (unsigned)s_chunk, s_wn->get_samp_rate(s_md));
++    return true;
++}
++
++bool muse_wake_feed(const int16_t *pcm, size_t frames)
++{
++    if (!s_md) {
++        return false;
++    }
++    bool heard = false;
++    while (frames) {
++        size_t take = s_chunk - s_fill < frames ? s_chunk - s_fill : frames;
++        memcpy(s_buf + s_fill, pcm, take * sizeof(int16_t));
++        s_fill += take;
++        pcm += take;
++        frames -= take;
++        if (s_fill == s_chunk) {
++            s_fill = 0;
++            if (s_wn->detect(s_md, s_buf) == WAKENET_DETECTED && s_ignore <= 0) {
++                heard = true;
++            }
++            if (s_ignore > 0) {
++                s_ignore--;
++            }
++        }
++    }
++    return heard;
++}
++
++/*
++ * Loading maps the model partition, which freezes the caches: the caller's
++ * stack must then be in internal RAM, and the voice task's is in PSRAM. So it
++ * loads on a short-lived task with an internal stack.
++ */
++static TaskHandle_t s_waiter;
++static bool s_loaded;
++
++static void load_task(void *arg)
++{
++    s_loaded = load();
++    xTaskNotifyGive(s_waiter);
++    vTaskDelete(NULL);
++}
++
++bool muse_wake_init(void)
++{
++    s_waiter = xTaskGetCurrentTaskHandle();
++    if (xTaskCreate(load_task, "wake_load", 6144, NULL, 5, NULL) != pdPASS) {
++        ESP_LOGE(TAG, "no memory to load the model");
++        return false;
++    }
++    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
++    return s_loaded;
++}
++
++/*
++ * esp-sr 2.5.5's wn9l clean() dereferences a NULL queue and panics, so the
++ * model isn't cleaned: its window still holds the wake word, and detections
++ * are ignored until about 1.5 s of new audio has gone through it.
++ */
++void muse_wake_reset(void)
++{
++    s_fill = 0;
++    s_ignore = s_chunk ? (int)(16000 * 3 / 2 / s_chunk) : 0;
++}
+diff --git a/esp32/components/muse/muse_wake.h b/esp32/components/muse/muse_wake.h
+new file mode 100644
+index 0000000..51c9b6a
+--- /dev/null
++++ b/esp32/components/muse/muse_wake.h
+@@ -0,0 +1,34 @@
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++/*
++ * Hands-free wake word (CONFIG_MUSE_WAKE_WORD): ESP-SR WakeNet on the idle
++ * mic audio. The model comes from the "model" partition, which esp-sr's build
++ * fills with the WakeNet chosen in menuconfig (CONFIG_SR_WN_*).
++ */
++
++/* Loads the model. False if it isn't there; feeding is then a no-op. */
++bool muse_wake_init(void);
++
++/* Feeds 16 kHz mono audio; true when the wake word has just been heard. */
++bool muse_wake_feed(const int16_t *pcm, size_t frames);
++
++/* Drops buffered audio, e.g. after Muse spoke or recorded. */
++void muse_wake_reset(void);
+diff --git a/esp32/devices/sdkconfig.muse-stackchan b/esp32/devices/sdkconfig.muse-stackchan
+new file mode 100644
+index 0000000..48127df
+--- /dev/null
++++ b/esp32/devices/sdkconfig.muse-stackchan
+@@ -0,0 +1,12 @@
++# M5Stack StackChan: a CoreS3 on the StackChan body. Load after
++# devices/sdkconfig.muse-m5stack-cores3 to add the neck servo commands and
++# Korean captions (the CJK caption font, regenerated with Hangul).
++CONFIG_HOMEHUB_STACKCHAN_HEAD=y
++CONFIG_MUSE_CJK_FONT=y
++
++# "Hi, Stack Chan" wake word: ESP-SR WakeNet9l in a "model" partition at 0x830000.
++CONFIG_MUSE_WAKE_WORD=y
++CONFIG_SR_WN_WN9L_HISTACKCHAN_TTS3=y
++CONFIG_SR_MN_CN_NONE=y
++CONFIG_SR_MN_EN_NONE=y
++CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_muse_stackchan.csv"
+diff --git a/esp32/main/CMakeLists.txt b/esp32/main/CMakeLists.txt
+index 22fca2f..b01e015 100644
+--- a/esp32/main/CMakeLists.txt
++++ b/esp32/main/CMakeLists.txt
+@@ -85,6 +85,10 @@ if(CONFIG_HOMEHUB_LED_BACKEND_DEVKIT_GPIO27 OR CONFIG_HOMEHUB_LED_BACKEND_VOICE_
+     list(APPEND GADGET_REQUIRES led_strip)
+ endif()
+ 
++if(CONFIG_HOMEHUB_STACKCHAN_HEAD)
++    list(APPEND GADGET_SRCS "stackchan_head.c")
++endif()
++
+ if(CONFIG_HOMEHUB_SENSECAP_SENSORS)
+     list(APPEND GADGET_SRCS "sensecap_sensors.c")
+ endif()
+diff --git a/esp32/main/Kconfig.projbuild b/esp32/main/Kconfig.projbuild
+index d0fb1d8..66f5e81 100644
+--- a/esp32/main/Kconfig.projbuild
++++ b/esp32/main/Kconfig.projbuild
+@@ -264,6 +264,16 @@ menu "ESP32 Device SDK"
+             switch is on, the button keeps its setup role (tap to confirm
+             pairing, hold to reset).
+ 
++    config HOMEHUB_STACKCHAN_HEAD
++        bool "StackChan neck servos (head.move, head.gesture, head.get)"
++        depends on MUSE_BOARD_M5STACK_CORES3
++        default n
++        help
++            Drive the two Feetech SCS neck servos of an M5Stack StackChan
++            (CoreS3 body) on UART1, GPIO 6/7, and power them through the
++            PY32 IO expander at 0x6F. Advertises head.move, head.gesture and
++            head.get so Muse can turn the head.
++
+     config HOMEHUB_SENSECAP_SENSORS
+         bool "SenseCAP Indicator air sensors (sensors.read)"
+         depends on HOMEHUB_LED_BACKEND_SENSECAP_ST7701
+diff --git a/esp32/main/app.c b/esp32/main/app.c
+index 2cfb86a..0ea5e9a 100644
+--- a/esp32/main/app.c
++++ b/esp32/main/app.c
+@@ -68,6 +68,9 @@
+ #if CONFIG_HOMEHUB_SENSECAP_SENSORS
+ #include "sensecap_sensors.h"
+ #endif
++#if CONFIG_HOMEHUB_STACKCHAN_HEAD
++#include "stackchan_head.h"
++#endif
+ #if CONFIG_MUSE_WATCHER_CAMERA
+ #include "boards/watcher_camera.h"
+ #endif
+@@ -1895,6 +1898,13 @@ static cJSON *on_ws_command(
+         return voice_configure_command(params);
+     }
+ #endif
++#if CONFIG_HOMEHUB_STACKCHAN_HEAD
++    if (strncmp(command, "head.", 5) == 0) {
++        cJSON *head = stackchan_head_command(command, params, request_id,
++                                             session_generation);
++        if (head) return head;
++    }
++#endif
+ #if CONFIG_HOMEHUB_SENSECAP_SENSORS
+     if (strcmp(command, "sensors.read") == 0) {
+         return sensecap_sensors_command();
+diff --git a/esp32/main/noise_control.cpp b/esp32/main/noise_control.cpp
+index 2ba3e31..9e5575f 100644
+--- a/esp32/main/noise_control.cpp
++++ b/esp32/main/noise_control.cpp
+@@ -1378,6 +1378,44 @@ static char *build_register_json(void) {
+                 nullptr, nullptr);
+ #endif
+ 
++#if CONFIG_HOMEHUB_STACKCHAN_HEAD
++    {
++        cJSON *move_required = cJSON_CreateObject();
++        cJSON *yaw = cJSON_CreateObject();
++        cJSON_AddStringToObject(yaw, "type", "number");
++        cJSON_AddStringToObject(yaw, "description",
++                                "Degrees, -128 to 128; 0 faces forward, positive turns to the robot's left.");
++        cJSON_AddItemToObject(move_required, "yaw", yaw);
++        cJSON *pitch = cJSON_CreateObject();
++        cJSON_AddStringToObject(pitch, "type", "number");
++        cJSON_AddStringToObject(pitch, "description",
++                                "Degrees, 0 (level) to 90 (looking up).");
++        cJSON_AddItemToObject(move_required, "pitch", pitch);
++        cJSON *move_optional = cJSON_CreateObject();
++        cJSON *duration = cJSON_CreateObject();
++        cJSON_AddStringToObject(duration, "type", "integer");
++        cJSON_AddStringToObject(duration, "description",
++                                "How long the move takes, 100 to 3000 ms; default 600.");
++        cJSON_AddItemToObject(move_optional, "duration_ms", duration);
++        add_command(commands, "head.move",
++                    "Turn your own head (this StackChan robot's neck) to an "
++                    "absolute pose. Returns the measured yaw_deg and pitch_deg.",
++                    move_required, move_optional);
++
++        cJSON *gesture_required = cJSON_CreateObject();
++        cJSON_AddItemToObject(gesture_required, "name",
++                              string_param("nod (yes), shake (no), look_around, "
++                                           "or home (face forward)."));
++        add_command(commands, "head.gesture",
++                    "Make a head gesture with your own neck, e.g. nod while "
++                    "agreeing or shake while disagreeing.",
++                    gesture_required, nullptr);
++        add_command(commands, "head.get",
++                    "Read your neck's current yaw_deg and pitch_deg.",
++                    nullptr, nullptr);
++    }
++#endif
++
+ #if CONFIG_MUSE_WATCHER_CAMERA
+     add_command(commands, "camera.capture",
+                 "Capture one still JPEG frame from the SenseCAP Watcher camera. "
+diff --git a/esp32/main/stackchan_head.c b/esp32/main/stackchan_head.c
+new file mode 100644
+index 0000000..8544870
+--- /dev/null
++++ b/esp32/main/stackchan_head.c
+@@ -0,0 +1,396 @@
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "stackchan_head.h"
++
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "driver/i2c_master.h"
++#include "driver/uart.h"
++#include "esp_log.h"
++#include "esp_timer.h"
++#include "freertos/FreeRTOS.h"
++#include "freertos/semphr.h"
++#include "freertos/task.h"
++
++static const char *TAG = "stackchan_head";
++
++// From the CoreS3 BSP, which the Muse board code has already brought up.
++extern i2c_master_bus_handle_t bsp_i2c_get_handle(void);
++
++// ---- Hardware constants (StackChan-BSP servo_init) -------------------------
++
++#define HEAD_UART       UART_NUM_1
++#define HEAD_TX_GPIO    6
++#define HEAD_RX_GPIO    7
++#define HEAD_BAUD       1000000
++
++#define PY32_ADDR       0x6F
++#define PY32_REG_VER    0x02
++#define PY32_REG_DIR_L  0x03
++#define PY32_REG_OUT_L  0x05
++#define PY32_REG_PU_L   0x09
++#define PY32_REG_PD_L   0x0B
++#define PY32_SERVO_PIN  0   // VM EN
++
++#define SCS_INST_READ   0x02
++#define SCS_INST_WRITE  0x03
++#define SCS_REG_TORQUE  40
++#define SCS_REG_GOAL    42  // position, time, speed: 3 big-endian words
++#define SCS_REG_POS     56
++#define SCS_TIMEOUT_MS  10
++
++#define YAW_ID          1
++#define PITCH_ID        2
++#define YAW_ZERO_RAW    460
++#define PITCH_ZERO_RAW  620
++#define YAW_MIN_DEG     (-128.0f)
++#define YAW_MAX_DEG     128.0f
++#define PITCH_MIN_DEG   0.0f
++#define PITCH_MAX_DEG   90.0f
++#define RAW_PER_DEG     3.2f  // one step is 0.3125 degrees
++
++#define DURATION_MIN_MS 100
++#define DURATION_MAX_MS 3000
++#define DURATION_DEF_MS 600
++
++// ---- Low-level buses --------------------------------------------------------
++
++static SemaphoreHandle_t s_lock;
++static bool s_ready;
++static i2c_master_dev_handle_t s_py32;
++
++static esp_err_t py32_read(uint8_t reg, uint8_t *val) {
++    return i2c_master_transmit_receive(s_py32, &reg, 1, val, 1, 100);
++}
++
++static esp_err_t py32_write(uint8_t reg, uint8_t val) {
++    uint8_t buf[2] = {reg, val};
++    return i2c_master_transmit(s_py32, buf, sizeof(buf), 100);
++}
++
++static esp_err_t py32_set_bit(uint8_t reg, uint8_t bit, bool on) {
++    uint8_t v = 0;
++    esp_err_t err = py32_read(reg, &v);
++    if (err != ESP_OK) return err;
++    v = on ? (v | (1u << bit)) : (v & ~(1u << bit));
++    return py32_write(reg, v);
++}
++
++static esp_err_t servo_power_on(void) {
++    i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
++    if (!bus) return ESP_ERR_INVALID_STATE;
++    const i2c_device_config_t cfg = {
++        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
++        .device_address = PY32_ADDR,
++        .scl_speed_hz = 100000,
++    };
++    esp_err_t err = i2c_master_bus_add_device(bus, &cfg, &s_py32);
++    if (err != ESP_OK) return err;
++
++    // The PY32 boots slowly; the BSP waits up to 1.2 s for its version.
++    uint8_t ver = 0;
++    for (int i = 0; i < 6; i++) {
++        if (py32_read(PY32_REG_VER, &ver) == ESP_OK && ver != 0 && ver != 0xFF) break;
++        vTaskDelay(pdMS_TO_TICKS(200));
++    }
++    if (ver == 0 || ver == 0xFF) return ESP_ERR_NOT_FOUND;
++    ESP_LOGI(TAG, "PY32 IO expander version 0x%02x", ver);
++
++    if ((err = py32_set_bit(PY32_REG_DIR_L, PY32_SERVO_PIN, true)) != ESP_OK) return err;
++    if ((err = py32_set_bit(PY32_REG_PD_L, PY32_SERVO_PIN, false)) != ESP_OK) return err;
++    if ((err = py32_set_bit(PY32_REG_PU_L, PY32_SERVO_PIN, true)) != ESP_OK) return err;
++    if ((err = py32_set_bit(PY32_REG_OUT_L, PY32_SERVO_PIN, true)) != ESP_OK) return err;
++    vTaskDelay(pdMS_TO_TICKS(200));
++    return ESP_OK;
++}
++
++static esp_err_t uart_up(void) {
++    const uart_config_t cfg = {
++        .baud_rate = HEAD_BAUD,
++        .data_bits = UART_DATA_8_BITS,
++        .parity = UART_PARITY_DISABLE,
++        .stop_bits = UART_STOP_BITS_1,
++        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
++        .source_clk = UART_SCLK_DEFAULT,
++    };
++    esp_err_t err = uart_driver_install(HEAD_UART, 256, 0, 0, NULL, 0);
++    if (err == ESP_OK) err = uart_param_config(HEAD_UART, &cfg);
++    if (err == ESP_OK) {
++        err = uart_set_pin(HEAD_UART, HEAD_TX_GPIO, HEAD_RX_GPIO,
++                           UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
++    }
++    return err;
++}
++
++static esp_err_t head_init(void) {
++    if (s_ready) return ESP_OK;
++    esp_err_t err = servo_power_on();
++    if (err != ESP_OK) {
++        ESP_LOGE(TAG, "servo power: %s", esp_err_to_name(err));
++        return err;
++    }
++    err = uart_up();
++    if (err != ESP_OK) {
++        ESP_LOGE(TAG, "servo uart: %s", esp_err_to_name(err));
++        return err;
++    }
++    s_ready = true;
++    return ESP_OK;
++}
++
++// One SCS request: FF FF id len inst [addr data...] ~sum. Reads the status
++// reply (FF FF id len err [data...] ~sum) into reply_data when given. Returns
++// the number of data bytes read, or -1.
++static int scs_request(uint8_t id, uint8_t inst, uint8_t addr,
++                       const uint8_t *data, uint8_t n,
++                       uint8_t *reply_data, uint8_t reply_n) {
++    uint8_t pkt[16];
++    uint8_t len = (uint8_t)(n + 3);
++    pkt[0] = 0xFF; pkt[1] = 0xFF; pkt[2] = id; pkt[3] = len; pkt[4] = inst;
++    pkt[5] = addr;
++    uint8_t sum = id + len + inst + addr;
++    for (uint8_t i = 0; i < n; i++) {
++        pkt[6 + i] = data[i];
++        sum += data[i];
++    }
++    pkt[6 + n] = (uint8_t)~sum;
++
++    uart_flush_input(HEAD_UART);
++    uart_write_bytes(HEAD_UART, pkt, 7 + n);
++    uart_wait_tx_done(HEAD_UART, pdMS_TO_TICKS(SCS_TIMEOUT_MS));
++
++    // Find the FF FF header, then id, len, err, data, checksum.
++    uint8_t b = 0, prev = 0;
++    int64_t deadline = esp_timer_get_time() + SCS_TIMEOUT_MS * 1000;
++    for (;;) {
++        if (esp_timer_get_time() > deadline) return -1;
++        if (uart_read_bytes(HEAD_UART, &b, 1, pdMS_TO_TICKS(2)) != 1) continue;
++        if (prev == 0xFF && b == 0xFF) break;
++        prev = b;
++    }
++    uint8_t head[3];
++    if (uart_read_bytes(HEAD_UART, head, 3, pdMS_TO_TICKS(SCS_TIMEOUT_MS)) != 3) return -1;
++    if (head[0] != id || head[1] < 2) return -1;
++    uint8_t data_n = head[1] - 2;
++    uint8_t body[8];
++    if (data_n > sizeof(body)) return -1;
++    if (data_n && uart_read_bytes(HEAD_UART, body, data_n, pdMS_TO_TICKS(SCS_TIMEOUT_MS)) != data_n) return -1;
++    uint8_t chk;
++    if (uart_read_bytes(HEAD_UART, &chk, 1, pdMS_TO_TICKS(SCS_TIMEOUT_MS)) != 1) return -1;
++    uint8_t calc = head[0] + head[1] + head[2];
++    for (uint8_t i = 0; i < data_n; i++) calc += body[i];
++    if ((uint8_t)~calc != chk) return -1;
++    if (reply_data) {
++        if (data_n != reply_n) return -1;
++        memcpy(reply_data, body, data_n);
++    }
++    return data_n;
++}
++
++static bool scs_torque(uint8_t id, bool on) {
++    uint8_t v = on ? 1 : 0;
++    return scs_request(id, SCS_INST_WRITE, SCS_REG_TORQUE, &v, 1, NULL, 0) >= 0;
++}
++
++static bool scs_goal(uint8_t id, int raw, int time_ms) {
++    uint8_t d[6] = {
++        (uint8_t)(raw >> 8), (uint8_t)raw,
++        (uint8_t)(time_ms >> 8), (uint8_t)time_ms,
++        0, 0,  // speed 0: let time decide
++    };
++    return scs_request(id, SCS_INST_WRITE, SCS_REG_GOAL, d, sizeof(d), NULL, 0) >= 0;
++}
++
++static int scs_position(uint8_t id) {
++    uint8_t len = 2, d[2];
++    if (scs_request(id, SCS_INST_READ, SCS_REG_POS, &len, 1, d, 2) != 2) return -1;
++    return (d[0] << 8) | d[1];
++}
++
++// ---- Angles -----------------------------------------------------------------
++
++static float clampf(float v, float lo, float hi) {
++    return v < lo ? lo : (v > hi ? hi : v);
++}
++
++static int deg_to_raw(int zero, float deg) {
++    int raw = zero + (int)lroundf(deg * RAW_PER_DEG);
++    return raw < 0 ? 0 : (raw > 1000 ? 1000 : raw);
++}
++
++static float raw_to_deg(int zero, int raw) {
++    return (raw - zero) / RAW_PER_DEG;
++}
++
++// Moves both axes and waits for the move to finish. Torque stays on so the
++// head holds its pose.
++static bool head_move(float yaw, float pitch, int duration_ms) {
++    yaw = clampf(yaw, YAW_MIN_DEG, YAW_MAX_DEG);
++    pitch = clampf(pitch, PITCH_MIN_DEG, PITCH_MAX_DEG);
++    bool ok = scs_torque(YAW_ID, true) && scs_torque(PITCH_ID, true)
++           && scs_goal(YAW_ID, deg_to_raw(YAW_ZERO_RAW, yaw), duration_ms)
++           && scs_goal(PITCH_ID, deg_to_raw(PITCH_ZERO_RAW, pitch), duration_ms);
++    vTaskDelay(pdMS_TO_TICKS(duration_ms + 100));
++    return ok;
++}
++
++static bool head_read(float *yaw, float *pitch) {
++    int y = scs_position(YAW_ID), p = scs_position(PITCH_ID);
++    if (y < 0 || p < 0) return false;
++    *yaw = raw_to_deg(YAW_ZERO_RAW, y);
++    *pitch = raw_to_deg(PITCH_ZERO_RAW, p);
++    return true;
++}
++
++// ---- Commands ---------------------------------------------------------------
++
++typedef enum { HEAD_MOVE, HEAD_GESTURE, HEAD_GET } head_op_t;
++typedef enum { GESTURE_NOD, GESTURE_SHAKE, GESTURE_LOOK_AROUND, GESTURE_HOME } gesture_t;
++
++typedef struct {
++    head_op_t op;
++    float yaw, pitch;
++    int duration_ms;
++    gesture_t gesture;
++    noise_ctrl_session_generation_t session_generation;
++    char request_id[64];
++} head_job_t;
++
++static cJSON *error_result(const char *code, const char *message) {
++    cJSON *r = cJSON_CreateObject();
++    cJSON_AddBoolToObject(r, "ok", false);
++    cJSON *e = cJSON_AddObjectToObject(r, "error");
++    cJSON_AddStringToObject(e, "code", code);
++    cJSON_AddStringToObject(e, "message", message);
++    return r;
++}
++
++static bool run_gesture(gesture_t g) {
++    float y0 = 0, p0 = 20;
++    head_read(&y0, &p0);  // gestures start from the current pose
++    bool ok = true;
++    switch (g) {
++    case GESTURE_NOD:
++        for (int i = 0; i < 2 && ok; i++) {
++            ok = head_move(y0, clampf(p0 + 15, PITCH_MIN_DEG, PITCH_MAX_DEG), 250)
++              && head_move(y0, p0, 250);
++        }
++        break;
++    case GESTURE_SHAKE:
++        for (int i = 0; i < 2 && ok; i++) {
++            ok = head_move(y0 - 25, p0, 250) && head_move(y0 + 25, p0, 300);
++        }
++        ok = ok && head_move(y0, p0, 250);
++        break;
++    case GESTURE_LOOK_AROUND:
++        ok = head_move(-60, 25, 900) && head_move(60, 25, 1400)
++          && head_move(y0, p0, 900);
++        break;
++    case GESTURE_HOME:
++        ok = head_move(0, 0, 800);
++        break;
++    }
++    return ok;
++}
++
++static void head_task(void *arg) {
++    head_job_t *job = (head_job_t *)arg;
++    cJSON *result = NULL;
++
++    xSemaphoreTake(s_lock, portMAX_DELAY);
++    if (head_init() != ESP_OK) {
++        result = error_result("hardware", "servo bus did not come up; is the StackChan base attached?");
++    } else {
++        bool ok = true;
++        if (job->op == HEAD_MOVE) ok = head_move(job->yaw, job->pitch, job->duration_ms);
++        else if (job->op == HEAD_GESTURE) ok = run_gesture(job->gesture);
++
++        float yaw = 0, pitch = 0;
++        bool read_ok = head_read(&yaw, &pitch);
++        if (!ok || !read_ok) {
++            result = error_result("servo_no_reply", "a neck servo did not answer");
++        } else {
++            result = cJSON_CreateObject();
++            cJSON_AddBoolToObject(result, "ok", true);
++            cJSON *payload = cJSON_AddObjectToObject(result, "payload");
++            cJSON_AddNumberToObject(payload, "yaw_deg", roundf(yaw * 10) / 10);
++            cJSON_AddNumberToObject(payload, "pitch_deg", roundf(pitch * 10) / 10);
++        }
++    }
++    xSemaphoreGive(s_lock);
++
++    ESP_LOGI(TAG, "op %d done: %s", job->op,
++             cJSON_IsTrue(cJSON_GetObjectItem(result, "ok")) ? "ok" : "error");
++    noise_ctrl_send_command_result(job->session_generation, job->request_id, result);
++    free(job);
++    vTaskDelete(NULL);
++}
++
++static bool number_param(cJSON *params, const char *key, float *out) {
++    cJSON *item = params ? cJSON_GetObjectItem(params, key) : NULL;
++    if (!cJSON_IsNumber(item) || !isfinite(item->valuedouble)) return false;
++    *out = (float)item->valuedouble;
++    return true;
++}
++
++cJSON *stackchan_head_command(const char *command, cJSON *params,
++                              const char *request_id,
++                              noise_ctrl_session_generation_t session_generation) {
++    head_op_t op;
++    if (strcmp(command, "head.move") == 0) op = HEAD_MOVE;
++    else if (strcmp(command, "head.gesture") == 0) op = HEAD_GESTURE;
++    else if (strcmp(command, "head.get") == 0) op = HEAD_GET;
++    else return NULL;
++
++    if (!s_lock) s_lock = xSemaphoreCreateMutex();
++    if (!s_lock) return error_result("out_of_memory", "failed to allocate");
++
++    head_job_t *job = calloc(1, sizeof(*job));
++    if (!job) return error_result("out_of_memory", "failed to allocate");
++    job->op = op;
++    job->session_generation = session_generation;
++    strncpy(job->request_id, request_id ? request_id : "", sizeof(job->request_id) - 1);
++
++    if (op == HEAD_MOVE) {
++        if (!number_param(params, "yaw", &job->yaw) || !number_param(params, "pitch", &job->pitch)) {
++            free(job);
++            return error_result("missing_param", "yaw and pitch are required numbers");
++        }
++        float d = DURATION_DEF_MS;
++        number_param(params, "duration_ms", &d);
++        job->duration_ms = (int)clampf(d, DURATION_MIN_MS, DURATION_MAX_MS);
++    } else if (op == HEAD_GESTURE) {
++        cJSON *name = params ? cJSON_GetObjectItem(params, "name") : NULL;
++        const char *n = cJSON_IsString(name) ? name->valuestring : "";
++        if (strcmp(n, "nod") == 0) job->gesture = GESTURE_NOD;
++        else if (strcmp(n, "shake") == 0) job->gesture = GESTURE_SHAKE;
++        else if (strcmp(n, "look_around") == 0) job->gesture = GESTURE_LOOK_AROUND;
++        else if (strcmp(n, "home") == 0) job->gesture = GESTURE_HOME;
++        else {
++            free(job);
++            return error_result("invalid_param", "name must be nod, shake, look_around or home");
++        }
++    }
++
++    if (xTaskCreate(head_task, "head", 4096, job, 4, NULL) != pdPASS) {
++        free(job);
++        return error_result("out_of_memory", "failed to start head task");
++    }
++    cJSON *async = cJSON_CreateObject();
++    cJSON_AddBoolToObject(async, "_async", true);
++    return async;
++}
+diff --git a/esp32/main/stackchan_head.h b/esp32/main/stackchan_head.h
+new file mode 100644
+index 0000000..65324a0
+--- /dev/null
++++ b/esp32/main/stackchan_head.h
+@@ -0,0 +1,30 @@
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include "cJSON.h"
++#include "noise_control.h"
++
++// StackChan's two-axis neck on an M5Stack CoreS3: two Feetech SCS servos on
++// UART1 (TX GPIO 6, RX GPIO 7, 1 Mbps), powered through pin 0 of the PY32 IO
++// expander at 0x6F on the internal I2C bus. Constants follow M5Stack's
++// StackChan-BSP (servo_init() in M5StackChan.cpp).
++//
++// Handles head.move, head.gesture and head.get. Each runs in its own task and
++// answers with noise_ctrl_send_command_result(), so it returns {"_async": true}
++// or a command error. Returns NULL when the command isn't a head command.
++cJSON *stackchan_head_command(const char *command, cJSON *params,
++                              const char *request_id,
++                              noise_ctrl_session_generation_t session_generation);
+diff --git a/esp32/partitions_muse_stackchan.csv b/esp32/partitions_muse_stackchan.csv
+new file mode 100644
+index 0000000..55a8427
+--- /dev/null
++++ b/esp32/partitions_muse_stackchan.csv
+@@ -0,0 +1,22 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++nvs,       data, nvs,     0x11000,  0xC000,
++otadata,   data, ota,     0x1D000,  0x2000,
++phy_init,  data, phy,     0x1F000,  0x1000,
++ota_0,     app,  ota_0,   0x20000,  4M,
++ota_1,     app,  ota_1,   0x420000, 4M,
++prod_data, data, 0x40,    0x820000, 0x1000,
++prod_bak,  data, 0x41,    0x821000, 0x1000,
++model,     data, spiffs,  0x830000, 1M,
+diff --git a/esp32/tools/muse/gen_cjk_font.sh b/esp32/tools/muse/gen_cjk_font.sh
+index d5f97d8..31cecef 100755
+--- a/esp32/tools/muse/gen_cjk_font.sh
++++ b/esp32/tools/muse/gen_cjk_font.sh
+@@ -16,7 +16,8 @@
+ # Regenerates components/muse/fonts/muse_font_cjk_16.c, the CJK fallback for
+ # the caption font (CONFIG_MUSE_CJK_FONT): GNU Unifont's 16x16 bitmaps, the
+ # same cell as unscii-16, for CJK punctuation, kana, every CJK Unified
+-# Ideograph and the fullwidth forms. Needs curl and npx (Node.js).
++# Ideograph, Hangul (compatibility jamo and every syllable) and the fullwidth
++# forms. Needs curl and npx (Node.js).
+ set -eu
+ 
+ VERSION=16.0.04
+@@ -31,7 +32,7 @@ curl -fsSL -o "$TMP/unifont.otf" \
+ echo "$SHA256  $TMP/unifont.otf" | shasum -a 256 -c - >/dev/null
+ npx -y lv_font_conv@1.5.3 --font "$TMP/unifont.otf" --size 16 --bpp 1 \
+     --format lvgl --lv-font-name muse_font_cjk_16 --no-compress \
+-    -r 0x3000-0x30FF -r 0x4E00-0x9FFF -r 0xFF00-0xFFEF -o "$TMP/font.c"
++    -r 0x3000-0x30FF -r 0x3130-0x318F -r 0x4E00-0x9FFF -r 0xAC00-0xD7A3 -r 0xFF00-0xFFEF -o "$TMP/font.c"
+ # The project includes LVGL as "lvgl.h"; the header names no temp paths.
+ sed -e 's|#include "lvgl/lvgl.h"|#include "lvgl.h"|' -e "s|$TMP/||g" "$TMP/font.c" > "$OUT"
+ echo "wrote $OUT"

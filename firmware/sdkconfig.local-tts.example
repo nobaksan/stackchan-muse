@@ -1,0 +1,5 @@
+# Optional: speak Muse's replies through your own TTS relay (../tts-relay).
+# Copy to sdkconfig.local-tts. It's in .gitignore: never commit it.
+CONFIG_MUSE_HTTP_TTS=y
+CONFIG_MUSE_HTTP_TTS_URL="https://tts.example.com/tts"
+CONFIG_MUSE_HTTP_TTS_KEY=""

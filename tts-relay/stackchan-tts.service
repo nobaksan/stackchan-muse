@@ -1,0 +1,16 @@
+# systemd unit for the relay. Replace /opt/stackchan-tts and youruser with your own.
+[Unit]
+Description=StackChan TTS relay (edge-tts)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=youruser
+WorkingDirectory=/opt/stackchan-tts
+EnvironmentFile=/opt/stackchan-tts/.env
+ExecStart=/opt/stackchan-tts/.venv/bin/python server.py
+Restart=on-failure
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

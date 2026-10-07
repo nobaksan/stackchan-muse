@@ -1,0 +1,4 @@
+# Copy to sdkconfig.local-token and put your own SDK token in it.
+# Get one at https://gadgets.muse.ai/settings/sdk-tokens (Account > SDK tokens).
+# sdkconfig.local-token is in .gitignore: never commit it.
+CONFIG_GADGET_SDK_TOKEN=""

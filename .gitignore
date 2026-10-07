@@ -1,0 +1,18 @@
+# Secrets: never commit. Copy the .example files and fill them in locally.
+firmware/sdkconfig.local-token
+firmware/sdkconfig.local-tts
+tts-relay/.env
+*.env
+!*.env.example
+
+# Upstream SDK clone and build output
+firmware/muse-gadget-sdk/
+build*/
+.cache/
+
+# Backups of your own board (contain Wi-Fi credentials and device tokens)
+*.bin
+
+__pycache__/
+.venv/
+.DS_Store
